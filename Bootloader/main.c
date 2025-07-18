@@ -25,6 +25,19 @@
 
 #define SPM_PAGESIZE 64
 
+// NVMCTRL Commands
+#define NVMCTRL_CMD_NOOP			0x00
+#define NVMCTRL_CMD_PAGEWRITE		0x01
+#define NVMCTRL_CMD_PAGEERASE		0x02
+#define NVMCTRL_CMD_PAGEERASEWRITE	0x03
+
+#define BOOTEND_FUSE				(0x03)
+#define BOOT_SIZE                   (BOOTEND_FUSE * 0x100)
+
+// Memory mapping für Flash-Zugriff
+#define FLASH_PAGE_SIZE 64
+#define FLASH_PAGE_SIZE_WORDS (FLASH_PAGE_SIZE / 2)
+
 FUSES = {
 	.WDTCFG = 0x00, // WDTCFG {PERIOD=OFF, WINDOW=OFF}
 	.BODCFG = 0xE0, // BODCFG {SLEEP=DIS, ACTIVE=DIS, SAMPFREQ=1KHz, LVL=BODLEVEL7}
@@ -32,8 +45,19 @@ FUSES = {
 	.TCD0CFG = 0x00, // TCD0CFG {CMPA=CLEAR, CMPB=CLEAR, CMPC=CLEAR, CMPD=CLEAR, CMPAEN=CLEAR, CMPBEN=CLEAR, CMPCEN=CLEAR, CMPDEN=CLEAR}
 	.SYSCFG0 = 0xF6, // SYSCFG0 {EESAVE=CLEAR, RSTPINCFG=UPDI, CRCSRC=NOCRC}
 	.SYSCFG1 = 0x07, // SYSCFG1 {SUT=64MS}
-	.APPEND = 0x07, // APPEND {APPEND=User range:  0x0 - 0xFF}
-	.BOOTEND = 0x03, // BOOTEND {BOOTEND=User range:  0x0 - 0xFF}
+	// 1: 256 Byte
+	// 2: 512 Byte
+	// 3: 786 Byte
+	// 4: 1024 Byte
+	// 5: 1280 Byte
+	// 6: 1536 Byte
+	// 7: 1792 Byte
+	// 8: 2048 Byte
+	// 768 Byte for Bootloader
+	// 1024 Byte for Program
+	// 256 Byte for Data
+	.BOOTEND = BOOTEND_FUSE, // BOOTEND {BOOTEND=User range:  0x0 - 0xFF} 	
+	.APPEND = 0x00, // APPEND {APPEND=User range:  0x0 - 0xFF}
 };
 
 enum SysExReceptionState {
@@ -103,7 +127,7 @@ inline void write_buffer_to_flash()
 const uint8_t sysex_header[] = {
   0xf0,  // <SysEx>
   0x00, 0x21, 0x02,  // Manufacturer ID for Mutable instruments.
-  0x02,  // Product ID for "any other project".
+  0x00, 0x7F,  // Any other device
 };
 
 
@@ -114,7 +138,7 @@ void midi_rx_loop()
     uint16_t bytes_read = 0;
     uint16_t rx_buffer_index;
     uint8_t state = MATCHING_HEADER;
-    uint8_t checksum;
+    uint8_t checksum = 0;
     uint8_t sysex_commands[2];
     uint8_t current_led = 1;
     uint8_t status = 0;
@@ -125,13 +149,13 @@ void midi_rx_loop()
     
     while (1) 
     {
-        
+        // While the UART ist empty...
         while (!(USART0.STATUS & USART_RXCIF_bm) )
         {
-            ; // Do nothing
+            ; // ... do nothing.
         }
 
-        byte = USART0.RXDATAL;
+        byte = USART0.RXDATAL;	// There ist a byte in the UART.
         
         // In case we see a realtime message in the stream, safely ignore it.
         //if (byte > 0xf0 && byte != 0xf7) 
@@ -145,9 +169,13 @@ void midi_rx_loop()
             case MATCHING_HEADER:
                 // Check if the sysex_header is correct. If yes,
                 // go to READING_COMMAND
+				
+				// Compare the contents of byte to the sysex_header, byte by byte
                 if (byte == sysex_header[bytes_read]) 
                 {
                     ++bytes_read;
+					// If the amount of read bytes matches the size of the sysex_header
+					// continue to the next state.
                     if ( bytes_read == sizeof (sysex_header) ) 
                     {
                         bytes_read = 0;
@@ -205,6 +233,7 @@ void midi_rx_loop()
                     ++bytes_read;
                 }
                 else 
+				// F7: SysEx End
                 if (byte == 0xf7) 
                 {
                     // 7F 00 is the reset-command
@@ -218,14 +247,29 @@ void midi_rx_loop()
                     }
                     else 
                     // 7E 00 is the update command
-                    if (rx_buffer_index == SPM_PAGESIZE + 1 &&
-                        sysex_commands[0] == 0x7e &&
-                        sysex_commands[1] == 0x00 &&
-                        rx_buffer[rx_buffer_index - 1] == checksum) 
+                    if (rx_buffer_index == SPM_PAGESIZE + 1 &&			// Last byte of the page received
+                        sysex_commands[0] == 0x7e &&					//
+                        sysex_commands[1] == 0x00 &&					// Command Correct
+                        rx_buffer[rx_buffer_index - 1] == checksum)		// Checksum correct
                     {
+						uint16_t bootloader_offset = BOOTEND_FUSE * 256;
+						uint16_t* prog_start_addr = (uint16_t*)(MAPPED_PROGMEM_START + bootloader_offset + progress_counter * 64);
+						
                         // Block write.
                         // write_buffer_to_flash();
                         // page += SPM_PAGESIZE;
+						// Page Buffer mit Daten füllen
+						for (uint8_t i = 0; i < FLASH_PAGE_SIZE_WORDS; i++) // FLASH_PAGE_SIZE_WORDS = 64/2 = 32
+						{
+							// Convert the two 8-bit values to a 16-bit value
+							uint16_t word_data = rx_buffer[i*2] | (rx_buffer[i*2+1] << 8);
+							prog_start_addr[i] = word_data;
+						}
+						
+						// Page löschen und schreiben in einem Schritt
+						CPU_CCP = CCP_SPM_gc;
+						NVMCTRL.CTRLA = NVMCTRL_CMD_PAGEERASEWRITE;
+						
                         ++progress_counter;
                         if (progress_counter == 32) 
                         {
