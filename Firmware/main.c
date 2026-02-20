@@ -20,7 +20,7 @@
 #define MIDI_CONTINUE   0xFB
 #define MIDI_STOP       0xFC
 
-#define MIDITICKS_RELOAD 11		// 05: Normal Tempo
+#define MIDITICKS_RELOAD 05		// 05: Normal Tempo
 								// 11: Halved Tempo
 								
 // _bm = Bit Mask       Bsp: #define TCA_SINGLE_PERBV_bm  0x01  /* Period Buffer Valid bit mask.
@@ -67,13 +67,22 @@ enum state_enum
     INIT, HANDLE_START_REQ, HANDLE_CONT_REQ, RUN, STOP
 } state, state_old;
 
+enum keystate_enum
+{
+	NUDGE, TIMING 
+} keystate;
+
 void HandleButtons(void)
 {
+	// AUTO		SW_AUTO		PB0
+	// FAST		SW_DEC		PA2
+	// SLOW		SW_INC		PA3
+	
     if(TCA0.SINGLE.INTFLAGS & (1<<TCA_SINGLE_OVF_bp) )
     {
         // 10ms have elapsed
         
-        // Handle UP-Button
+        // Handle UP-Button (Upper, SW_AUTO)
         if(PORTB.IN & (1<<PIN0_bp))
         {
             button.up_act = 1;
@@ -87,8 +96,23 @@ void HandleButtons(void)
             button.up_pressed = 1;
         }
         button.up_prev = button.up_act;
+		
+		// Handle Status-Button (Middle, SW_DEC)
+		if(PORTA.IN & (1<<PIN2_bp))
+		{
+			button.st_act = 1;
+		}
+		else
+		{
+			button.st_act = 0;
+		}
+		if( (button.st_prev == 1) && (button.st_act == 0) )
+		{
+			button.st_pressed = 1;
+		}
+		button.st_prev = button.st_act;
         
-        // Handle DOWN-Button
+        // Handle DOWN-Button (Lower, SW_INC)
         if(PORTA.IN & (1<<PIN3_bp))
         {
             button.dn_act = 1;
@@ -234,7 +258,22 @@ int main(void)
         // 1: Update pressed buttons
         HandleButtons();
         
-        // 2: Update MIDI Input
+		// 2: Handle the select-Button
+		if(button.st_pressed)
+		{
+			switch(keystate)
+			{
+				case NUDGE:
+					keystate = TIMING;
+					break;
+				case TIMING:
+					keystate = NUDGE;
+					break;
+			}
+			button.st_pressed = 0;
+		}
+		
+        // 3: Update MIDI Input
         midi_in = HandleMIDI_IN();
         
         if(midi_in)

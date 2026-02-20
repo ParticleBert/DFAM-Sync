@@ -273,13 +273,6 @@ void midi_rx_loop()
                         ++progress_counter;
                         if (progress_counter == 32) 
                         {
-                            status |= current_led;
-                            current_led <<= 1;
-                            if (current_led == 0) 
-                            {
-                                current_led = 1;
-                                status = 0;
-                            }
                             progress_counter = 0;
                         }
                         status ^= current_led;
