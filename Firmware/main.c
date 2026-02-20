@@ -20,8 +20,35 @@
 #define MIDI_CONTINUE   0xFB
 #define MIDI_STOP       0xFC
 
-#define MIDITICKS_RELOAD 05		// 05: Normal Tempo
+// #define MIDITICKS_RELOAD 05		// 05: Normal Tempo
 								// 11: Halved Tempo
+
+// Clock Division Modes
+// Mode 0-3: Standard notes, Mode 4-7: Triplets
+const uint8_t division_factors[8] = {
+	24,  // Mode 0: 1/4  note  (Quarter notes)
+	12,  // Mode 1: 1/8  note  (Eighth notes)
+	6,  // Mode 2: 1/16 note  (Sixteenth notes) ? Default 1:1
+	3,  // Mode 3: 1/32 note  (Thirty-second notes)
+	16,  // Mode 4: 1/4  triplet
+	8,  // Mode 5: 1/8  triplet
+	4,  // Mode 6: 1/16 triplet
+	2   // Mode 7: 1/32 triplet
+};
+
+const uint16_t pattern_lengths[8] = {
+	192, // Mode 0: 8 steps × 24 = 192 MIDI clocks
+	96, // Mode 1: 8 steps × 12 = 96 MIDI clocks
+	48, // Mode 2: 8 steps × 6  = 48 MIDI clocks ? Default
+	24, // Mode 3: 8 steps × 3  = 24 MIDI clocks
+	128, // Mode 4: 8 steps × 16 = 128 MIDI clocks
+	64, // Mode 5: 8 steps × 8  = 64 MIDI clocks
+	32, // Mode 6: 8 steps × 4  = 32 MIDI clocks
+	16  // Mode 7: 8 steps × 2  = 16 MIDI clocks
+};
+
+// Division mode variables
+uint8_t current_mode = 1;  // Start at mode 2 (1/16 notes, 1:1 ratio)
 								
 // _bm = Bit Mask       Bsp: #define TCA_SINGLE_PERBV_bm  0x01  /* Period Buffer Valid bit mask.
 // _bp = Bit Position   Bsp: #define TCA_SINGLE_PERBV_bp  0  /* Period Buffer Valid bit position.
@@ -58,8 +85,9 @@ struct buttons_struct
 
 struct ctr_struct
 {
-    uint8_t miditicks;
-    uint8_t pulses;
+    uint8_t miditicks;	// Countdown für nächsten Trigger
+    uint8_t pulses;		// Bleibt für andere Zwecke
+	uint8_t dfam_step;	// NEU: Aktueller DFAM Step (0-7)
 } ctr;
 
 enum state_enum 
@@ -290,8 +318,9 @@ int main(void)
                 case HANDLE_START_REQ:
                     if(midi_in == MIDI_CLOCK)
                     {
-                        ctr.miditicks = MIDITICKS_RELOAD;
+                        ctr.miditicks = division_factors[current_mode] - 1;  // -1 weil du sofort dekrementierst
                         ctr.pulses = 7;
+						ctr.dfam_step = 0;
                         LED_ON;
                         SYNC_ON;
                         TCB0.CCMP = 10000;
@@ -309,14 +338,17 @@ int main(void)
                 case STOP:
                     if(midi_in == MIDI_START)
                     {
-                        // Send remaining pulses to the DFAM
-                        // reset ctr.pulse
-                        // reset ctr.miditicks
-                        while(ctr.pulses)
+						// Berechne wie viele Pulses bis Step 0
+						uint8_t pulses_to_send = ((8 - ctr.dfam_step) % 8) - 1;
+                        
+						// Sende die restlichen Pulses
+						while(pulses_to_send > 0)
                         {
                             SendOnePulse();
-                            ctr.pulses--;
+                            pulses_to_send--;
                         }
+						
+						ctr.dfam_step = 7;	// Jetzt auf Step 0
                         state = HANDLE_START_REQ;
                     }
                     if(midi_in == MIDI_CONTINUE)
@@ -336,40 +368,71 @@ int main(void)
                             TCB0.CNT = 0;
                             TCB0.CTRLA |= (1<<TCB_ENABLE_bp);
 							
-                            if(!ctr.pulses)
-                            {
-                                ctr.pulses = 7;
-                            }
-							else
+							// Neu: DFAM Step hochzählen
+							ctr.dfam_step++;
+							if(ctr.dfam_step >= 8)
 							{
-								ctr.pulses--;
+								ctr.dfam_step = 0;
 							}
-							// 5: normal
-                            ctr.miditicks = MIDITICKS_RELOAD;
+							
+                            ctr.miditicks = division_factors[current_mode] - 1;
                         }
 						else
 						{
-							// Interpret the buttons
-							// a) UP pressed: Don't subtract ctr_miditicks
-							if(button.up_pressed)
+							if(keystate == NUDGE)
 							{
-								button.up_pressed = 0; // Reset Flag
-								++ctr.miditicks;
-							}
-
-							// b) Nothing pressed: Subtract ctr_miditicks
-							--ctr.miditicks;
-
-							// c) DOWN pressed: Subtract 2 ctr_miditicks.
-							// Watch for underflow, so only do this when ctr_miditicks > 1
-							if(ctr.miditicks > 1)
-							{
-								if(button.dn_pressed)
+								// NUDGE Mode: Tempo adjustment
+								
+								// UP pressed: Speed up (don't subtract)
+								if(button.up_pressed)
 								{
-									--ctr.miditicks;
-									button.dn_pressed = 0;
+									button.up_pressed = 0; // Reset Flag
+									++ctr.miditicks;
+								}
+								// Normal: Subtract
+								--ctr.miditicks;
+
+								// DOWN pressed: Slow down (subtrackt twice)
+								if(ctr.miditicks > 1)
+								{
+									if(button.dn_pressed)
+									{
+										--ctr.miditicks;
+										button.dn_pressed = 0;
+									}
 								}
 							}
+							else // keystate == TIMING
+							{
+								// TIMING Mode: Division mode change
+                
+								// UP pressed: Smaller division (faster notes)
+								if(button.up_pressed)
+								{
+									button.up_pressed = 0;
+									if(current_mode < 7)
+									{
+										current_mode++;
+										// Update miditicks for new mode
+										ctr.miditicks = division_factors[current_mode] - 1;
+									}
+								}
+                
+								// DOWN pressed: Larger division (slower notes)
+								if(button.dn_pressed)
+								{
+									button.dn_pressed = 0;
+									if(current_mode > 0)
+									{
+										current_mode--;
+										// Update miditicks for new mode
+										ctr.miditicks = division_factors[current_mode] - 1;
+									}
+								}
+                
+							// In TIMING mode, still decrement normally
+							--ctr.miditicks;
+							}								
 						}
 					}
                     if(midi_in == MIDI_STOP)
