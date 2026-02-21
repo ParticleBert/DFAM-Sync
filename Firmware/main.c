@@ -30,39 +30,39 @@
 								// 11: Halved Tempo
 
 // Clock Division Modes
-// Mode 0-3: Standard notes, Mode 4-7: Triplets
 const uint8_t division_factors[8] = {
-	24,  // Mode 0: 1/4  note  (Quarter notes)
-	12,  // Mode 1: 1/8  note  (Eighth notes)
-	6,  // Mode 2: 1/16 note  (Sixteenth notes) ? Default 1:1
-	3,  // Mode 3: 1/32 note  (Thirty-second notes)
-	16,  // Mode 4: 1/4  triplet
-	8,  // Mode 5: 1/8  triplet
-	4,  // Mode 6: 1/16 triplet
-	2   // Mode 7: 1/32 triplet
+    24,  // Mode 0: 1/4  note
+    12,  // Mode 1: 1/8  note
+     6,  // Mode 2: 1/16 note <- Standard
+     3,  // Mode 3: 1/32 note
+     2,  // Mode 4: 1/32 triplet
+     4,  // Mode 5: 1/16 triplet
+     8,  // Mode 6: 1/8  triplet
+    16   // Mode 7: 1/4  triplet
 };
 
 const uint16_t pattern_lengths[8] = {
-	192, // Mode 0: 8 steps × 24 = 192 MIDI clocks
-	96, // Mode 1: 8 steps × 12 = 96 MIDI clocks
-	48, // Mode 2: 8 steps × 6  = 48 MIDI clocks ? Default
-	24, // Mode 3: 8 steps × 3  = 24 MIDI clocks
-	128, // Mode 4: 8 steps × 16 = 128 MIDI clocks
-	64, // Mode 5: 8 steps × 8  = 64 MIDI clocks
-	32, // Mode 6: 8 steps × 4  = 32 MIDI clocks
-	16  // Mode 7: 8 steps × 2  = 16 MIDI clocks
+    192, // Mode 0
+     96, // Mode 1
+     48, // Mode 2 <- Standard
+     24, // Mode 3
+     16, // Mode 4
+     32, // Mode 5
+     64, // Mode 6
+    128  // Mode 7
 };
 
 enum division_state_enum
 {
-	DIV_RUNNING,
-	DIV_PENDING
+	DIV_RUNNING,		// Normal laufend
+	DIV_PENDING,		// User hat Änderung angefordert
+	DIV_WAIT_FOR_STEP_0	// Master-Takt ist durch, warte auf DFAM Step 0
 } division_state;
 
 uint8_t pending_mode; 	// Der Modus, zu dem gewechselt werden soll
 
 // Division mode variables
-uint8_t current_mode = 1;  // Start at mode 2 (1/16 notes, 1:1 ratio)
+uint8_t current_mode = 2;  // Start at mode 2 (1/16 notes, 1:1 ratio)
 								
 // _bm = Bit Mask       Bsp: #define TCA_SINGLE_PERBV_bm  0x01  /* Period Buffer Valid bit mask.
 // _bp = Bit Position   Bsp: #define TCA_SINGLE_PERBV_bp  0  /* Period Buffer Valid bit position.
@@ -99,9 +99,9 @@ struct buttons_struct
 
 struct ctr_struct
 {
-    uint8_t miditicks;	// Countdown für nächsten Trigger
-    uint8_t pulses;		// Bleibt für andere Zwecke
-	uint8_t dfam_step;	// NEU: Aktueller DFAM Step (0-7)
+    uint8_t miditicks;		// Countdown für nächsten Trigger
+	uint8_t dfam_step;		// NEU: Aktueller DFAM Step (0-7)
+	uint8_t master_clock;	// NEU: Zählt MIDI-Clocks im Haupttakt (0-47)
 } ctr;
 
 enum state_enum 
@@ -111,7 +111,7 @@ enum state_enum
 
 enum keystate_enum
 {
-	NUDGE, TIMING 
+	TIMING, NUDGE
 } keystate;
 
 void HandleButtons(void)
@@ -172,13 +172,17 @@ void HandleButtons(void)
         button.dn_prev = button.dn_act;
         
 		// Blink LED if change is pending
-		if(division_state == DIV_PENDING)
+		if(division_state == DIV_PENDING || division_state == DIV_WAIT_FOR_STEP_0)
 		{
 			blink_state = !blink_state;
 			if(blink_state)
 				D9_ON;
 			else
 				D9_OFF;
+		}
+		else
+		{
+			D9_OFF;
 		}
 		
         // Clear the Interrupt flag
@@ -277,27 +281,6 @@ int main(void)
     TCB0.CCMP = 10000;  // 10ms
     // TCB0.CTRLA |= (1<<TCB_ENABLE_bp); // Enables TCB0
   
-    /*
-    while (ctr.pulses > 0)
-    {
-        TCB0.CCMP = 120; // 120µs = 0,12ms
-        TCB0.CNT = 0;
-        SYNC_ON;
-        TCB0.CTRLA |= (1<<TCB_ENABLE_bp); // Enables TCB0
-
-        while(!(TCB0.INTFLAGS & (TCB_CAPT_bm))); // Waits for the capture interrupt
-
-        TCB0.INTFLAGS |= (1<<TCB_CAPT_bm); // Clears the Interruptflag
-        SYNC_OFF;
-        TCB0.CCMP = 100; // 100µs = 0,1ms
-        TCB0.CNT = 0;
-
-        while(!(TCB0.INTFLAGS & (TCB_CAPT_bm))); // Waits for the capture interrupt
-        TCB0.INTFLAGS |= (1<<TCB_CAPT_bm); // Clears the Interruptflag            
-
-        ctr.pulses--;
-    }
-    */
     RUN_STOP_ON;
 	for(uint8_t i=0; i<7; i++)
 	{
@@ -345,8 +328,8 @@ int main(void)
                     if(midi_in == MIDI_CLOCK)
                     {
                         ctr.miditicks = division_factors[current_mode] - 1;  // -1 weil du sofort dekrementierst
-                        ctr.pulses = 7;
 						ctr.dfam_step = 0;
+						ctr.master_clock = 0;	// Neu: Master clock startet bei 0
                         LED_ON;
                         SYNC_ON;
                         TCB0.CCMP = 10000;
@@ -385,6 +368,43 @@ int main(void)
                 case RUN:
                     if(midi_in == MIDI_CLOCK)
                     {
+						ctr.master_clock++;
+						
+						// Prüfe ob Umschalt-Zeitpunkt erreicht ist
+						uint8_t should_check_switch = 0;
+						
+						// Bestimme ob wir in/zu Triolen wechseln
+						uint8_t involves_triplets = (current_mode >= 4) || (pending_mode >= 4);
+						
+						if(involves_triplets)
+						{
+							// Triolen: Bei jeder Viertelnote (12, 24, 36, 48)
+							if(ctr.master_clock >= 48)
+							{
+								ctr.master_clock = 0;
+								should_check_switch = 1;
+							}
+							else if ((ctr.master_clock == 12) || (ctr.master_clock == 24) || (ctr.master_clock == 36) ||(ctr.master_clock == 48))
+							{
+								should_check_switch = 1;
+							}
+						}
+						else
+						{
+							// Nur normale Noten: Bei Taktende (48)
+							if(ctr.master_clock >= 48)
+							{
+								ctr.master_clock >= 0;
+								should_check_switch = 1;
+							}
+						}
+						
+						// Wenn Zeitpunkt erreicht und Umschaltung pending
+						if(should_check_switch && division_state == DIV_PENDING)
+						{
+							division_state = DIV_WAIT_FOR_STEP_0;
+						}						
+						
                         if(ctr.miditicks==0)
                         {
 							// Send the pulse to ADV / CLOCK
@@ -400,11 +420,13 @@ int main(void)
 							{
 								ctr.dfam_step = 0;
 								
-								if(division_state == DIV_PENDING)
+								// DFAm ist auf Step 0. Prüfe, ob wir warten
+								if(division_state == DIV_WAIT_FOR_STEP_0)
 								{
+									// JETZT umschalten
 									current_mode = pending_mode;
 									division_state = DIV_RUNNING;
-									D9_OFF; // Blinken stoppen
+									D9_OFF;
 								}
 							}
 							
