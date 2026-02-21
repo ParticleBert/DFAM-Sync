@@ -26,30 +26,23 @@
 
 #define D9_OFF  do { PORTA.DIRCLR = (1<<PIN4_bp) | (1<<PIN1_bp); } while(0)
 
-// #define MIDITICKS_RELOAD 05		// 05: Normal Tempo
-								// 11: Halved Tempo
-
-// Clock Division Modes
-const uint8_t division_factors[8] = {
+// Clock Division Modes (6 modes)
+const uint8_t division_factors[6] = {
     24,  // Mode 0: 1/4  note
     12,  // Mode 1: 1/8  note
      6,  // Mode 2: 1/16 note <- Standard
-     3,  // Mode 3: 1/32 note
-     2,  // Mode 4: 1/32 triplet
-     4,  // Mode 5: 1/16 triplet
-     8,  // Mode 6: 1/8  triplet
-    16   // Mode 7: 1/4  triplet
+     4,  // Mode 3: 1/16 triplet
+     8,  // Mode 4: 1/8  triplet
+    16   // Mode 5: 1/4  triplet
 };
 
-const uint16_t pattern_lengths[8] = {
+const uint16_t pattern_lengths[6] = {
     192, // Mode 0
      96, // Mode 1
      48, // Mode 2 <- Standard
-     24, // Mode 3
-     16, // Mode 4
-     32, // Mode 5
-     64, // Mode 6
-    128  // Mode 7
+     32, // Mode 3
+     64, // Mode 4
+    128  // Mode 5
 };
 
 enum division_state_enum
@@ -99,9 +92,11 @@ struct buttons_struct
 
 struct ctr_struct
 {
-    uint8_t miditicks;		// Countdown für nächsten Trigger
-	uint8_t dfam_step;		// NEU: Aktueller DFAM Step (0-7)
-	uint8_t master_clock;	// NEU: Zählt MIDI-Clocks im Haupttakt (0-47)
+    uint8_t miditicks;			// Countdown für nächsten Trigger
+	uint8_t dfam_step;			// Aktueller DFAM Step (0-7)
+	uint8_t master_clock;		// Zählt MIDI-Clocks im Haupttakt (0-47)
+	uint8_t virtual_step;		// NEU: Virtueller Step für 1/16 Noten (Division 6)
+	uint8_t virtual_counter;	// NEU: Counter für virtuelle Steps
 } ctr;
 
 enum state_enum 
@@ -327,9 +322,11 @@ int main(void)
                 case HANDLE_START_REQ:
                     if(midi_in == MIDI_CLOCK)
                     {
-                        ctr.miditicks = division_factors[current_mode] - 1;  // -1 weil du sofort dekrementierst
+                        ctr.miditicks = division_factors[current_mode] - 1;
 						ctr.dfam_step = 0;
-						ctr.master_clock = 0;	// Neu: Master clock startet bei 0
+						ctr.master_clock = 0;
+						ctr.virtual_step = 0;		// NEU: Virtueller Step zurücksetzen
+						ctr.virtual_counter = 0;	// NEU: Virtueller Counter zurücksetzen
                         LED_ON;
                         SYNC_ON;
                         TCB0.CCMP = 10000;
@@ -357,7 +354,7 @@ int main(void)
                             pulses_to_send--;
                         }
 						
-						ctr.dfam_step = 7;	// Jetzt auf Step 0
+						ctr.dfam_step = 7;	// Jetzt auf Step 7 (vor Step 0)
                         state = HANDLE_START_REQ;
                     }
                     if(midi_in == MIDI_CONTINUE)
@@ -370,11 +367,23 @@ int main(void)
                     {
 						ctr.master_clock++;
 						
+						// NEU: Virtuellen 1/16-Noten-Step mitzählen (IMMER, unabhängig vom Modus)
+						ctr.virtual_counter++;
+						if(ctr.virtual_counter >= 6)  // Division 6 für 1/16 Noten
+						{
+							ctr.virtual_counter = 0;
+							ctr.virtual_step++;
+							if(ctr.virtual_step >= 8)
+							{
+								ctr.virtual_step = 0;
+							}
+						}
+						
 						// Prüfe ob Umschalt-Zeitpunkt erreicht ist
 						uint8_t should_check_switch = 0;
 						
 						// Bestimme ob wir in/zu Triolen wechseln
-						uint8_t involves_triplets = (current_mode >= 4) || (pending_mode >= 4);
+						uint8_t involves_triplets = (current_mode >= 3) || (pending_mode >= 3);
 						
 						if(involves_triplets)
 						{
@@ -384,7 +393,7 @@ int main(void)
 								ctr.master_clock = 0;
 								should_check_switch = 1;
 							}
-							else if ((ctr.master_clock == 12) || (ctr.master_clock == 24) || (ctr.master_clock == 36) ||(ctr.master_clock == 48))
+							else if ((ctr.master_clock == 12) || (ctr.master_clock == 24) || (ctr.master_clock == 36))
 							{
 								should_check_switch = 1;
 							}
@@ -394,7 +403,7 @@ int main(void)
 							// Nur normale Noten: Bei Taktende (48)
 							if(ctr.master_clock >= 48)
 							{
-								ctr.master_clock >= 0;
+								ctr.master_clock = 0;
 								should_check_switch = 1;
 							}
 						}
@@ -414,19 +423,35 @@ int main(void)
                             TCB0.CNT = 0;
                             TCB0.CTRLA |= (1<<TCB_ENABLE_bp);
 							
-							// Neu: DFAM Step hochzählen
+							// DFAM Step hochzählen
 							ctr.dfam_step++;
 							if(ctr.dfam_step >= 8)
 							{
 								ctr.dfam_step = 0;
 								
-								// DFAm ist auf Step 0. Prüfe, ob wir warten
+								// DFAM ist auf Step 0. Prüfe, ob wir warten
 								if(division_state == DIV_WAIT_FOR_STEP_0)
 								{
-									// JETZT umschalten
-									current_mode = pending_mode;
-									division_state = DIV_RUNNING;
-									D9_OFF;
+									// NEU: Spezialfall Mode 2 ? Mode 3 (kritischer Übergang)
+									if((current_mode == 2 && pending_mode == 3) || 
+									   (current_mode == 3 && pending_mode == 2))
+									{
+										// Nur umschalten wenn virtual_step auch auf 0 ist
+										if(ctr.virtual_step == 0)
+										{
+											current_mode = pending_mode;
+											division_state = DIV_RUNNING;
+											D9_OFF;
+										}
+										// Sonst weiter warten - LED blinkt weiter
+									}
+									else
+									{
+										// Alle anderen Wechsel: Normal umschalten
+										current_mode = pending_mode;
+										division_state = DIV_RUNNING;
+										D9_OFF;
+									}
 								}
 							}
 							
@@ -447,7 +472,7 @@ int main(void)
 								// Normal: Subtract
 								--ctr.miditicks;
 
-								// DOWN pressed: Slow down (subtrackt twice)
+								// DOWN pressed: Slow down (subtract twice)
 								if(ctr.miditicks > 1)
 								{
 									if(button.dn_pressed)
@@ -465,11 +490,10 @@ int main(void)
 								if(button.up_pressed)
 								{
 									button.up_pressed = 0;
-									if(current_mode < 7)
+									if(current_mode < 5)  // NEU: Max mode ist jetzt 5
 									{
 										pending_mode = current_mode + 1;
 										division_state = DIV_PENDING;
-										// Nicht sofort umschalten
 									}
 								}
                 
@@ -481,12 +505,11 @@ int main(void)
 									{
 										pending_mode = current_mode - 1;
 										division_state = DIV_PENDING;
-										// Nicht sofort umschalten
 									}
 								}
                 
-							// In TIMING mode, still decrement normally
-							--ctr.miditicks;
+								// In TIMING mode, still decrement normally
+								--ctr.miditicks;
 							}								
 						}
 					}
@@ -500,8 +523,7 @@ int main(void)
             }
         }
          
-        // 3: If a LED / Sync Pulse has been set, check for the 10ms-flag
-        // to turn it off.
+        // 4: If a LED / Sync Pulse has been set, check for the 10ms-flag to turn it off
         HandlePulse();
     }
 }
