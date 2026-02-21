@@ -20,6 +20,12 @@
 #define MIDI_CONTINUE   0xFB
 #define MIDI_STOP       0xFC
 
+#define D9_ON   do { PORTA.DIRSET = (1<<PIN4_bp) | (1<<PIN1_bp); \
+                     PORTA.OUTSET = (1<<PIN4_bp); \
+                     PORTA.OUTCLR = (1<<PIN1_bp); } while(0)
+
+#define D9_OFF  do { PORTA.DIRCLR = (1<<PIN4_bp) | (1<<PIN1_bp); } while(0)
+
 // #define MIDITICKS_RELOAD 05		// 05: Normal Tempo
 								// 11: Halved Tempo
 
@@ -46,6 +52,14 @@ const uint16_t pattern_lengths[8] = {
 	32, // Mode 6: 8 steps × 4  = 32 MIDI clocks
 	16  // Mode 7: 8 steps × 2  = 16 MIDI clocks
 };
+
+enum division_state_enum
+{
+	DIV_RUNNING,
+	DIV_PENDING
+} division_state;
+
+uint8_t pending_mode; 	// Der Modus, zu dem gewechselt werden soll
 
 // Division mode variables
 uint8_t current_mode = 1;  // Start at mode 2 (1/16 notes, 1:1 ratio)
@@ -106,6 +120,8 @@ void HandleButtons(void)
 	// FAST		SW_DEC		PA2
 	// SLOW		SW_INC		PA3
 	
+	static uint8_t blink_state = 0;
+	
     if(TCA0.SINGLE.INTFLAGS & (1<<TCA_SINGLE_OVF_bp) )
     {
         // 10ms have elapsed
@@ -155,6 +171,16 @@ void HandleButtons(void)
         }
         button.dn_prev = button.dn_act;
         
+		// Blink LED if change is pending
+		if(division_state == DIV_PENDING)
+		{
+			blink_state = !blink_state;
+			if(blink_state)
+				D9_ON;
+			else
+				D9_OFF;
+		}
+		
         // Clear the Interrupt flag
         TCA0.SINGLE.INTFLAGS |= (1<<TCA_SINGLE_OVF_bp);
     }
@@ -373,6 +399,13 @@ int main(void)
 							if(ctr.dfam_step >= 8)
 							{
 								ctr.dfam_step = 0;
+								
+								if(division_state == DIV_PENDING)
+								{
+									current_mode = pending_mode;
+									division_state = DIV_RUNNING;
+									D9_OFF; // Blinken stoppen
+								}
 							}
 							
                             ctr.miditicks = division_factors[current_mode] - 1;
@@ -412,9 +445,9 @@ int main(void)
 									button.up_pressed = 0;
 									if(current_mode < 7)
 									{
-										current_mode++;
-										// Update miditicks for new mode
-										ctr.miditicks = division_factors[current_mode] - 1;
+										pending_mode = current_mode + 1;
+										division_state = DIV_PENDING;
+										// Nicht sofort umschalten
 									}
 								}
                 
@@ -424,9 +457,9 @@ int main(void)
 									button.dn_pressed = 0;
 									if(current_mode > 0)
 									{
-										current_mode--;
-										// Update miditicks for new mode
-										ctr.miditicks = division_factors[current_mode] - 1;
+										pending_mode = current_mode - 1;
+										division_state = DIV_PENDING;
+										// Nicht sofort umschalten
 									}
 								}
                 
